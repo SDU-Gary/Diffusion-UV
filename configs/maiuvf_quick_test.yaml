@@ -1,0 +1,82 @@
+# MA-IUVF Quick Test Configuration
+# Fast configuration for testing and debugging
+
+experiment:
+  name: "maiuvf_quick_test"
+  description: "Quick test for rapid experimentation"
+  tags: ["test", "debug"]
+  version: "1.0"
+
+paths:
+  input_mesh: "data/models/stanford_bunny.obj"
+  texture: "data/textures/bunny_texture.png"
+  output_dir: "outputs/maiuvf_quick_test"
+
+baking:
+  num_samples: 1000
+  chart_mode: "uv_islands"
+  use_dynamic_sampling: false
+  virtual_epoch_size: 100000
+  sigma_ratio: 0.01
+
+training:
+  epochs: 10
+  batch_size: 4096
+  learning_rate: 0.001
+  device: "cuda"
+
+model:
+  encoder_type: "bspline_hash"
+  activation: "silu"
+  hidden_dim: 64
+  num_layers: 2
+  positional_encoding_freqs: 8
+  hash_grid:
+    learning_rate: null
+    num_levels: 16
+    features_per_level: 2
+    log2_size: 19
+    base_resolution: 16
+    max_resolution: 2048
+    cuda_backend: "auto"
+    weight_decay: 0.000001
+  mlp:
+    weight_decay: 0.0
+
+loss:
+  weights:
+    metric: 0.01
+    anchor: 1.0
+    classification: 1.0
+    centroid: 0.0
+    unified: 0.0
+  schedule:
+    strategy: "fixed"  # No scheduling for quick tests
+    phase_a_epochs: 30
+    ramp: "cosine"
+    target_weights:
+      metric: 1.0
+      anchor: 0.01
+      classification: 0.1
+    classification_cutoff:
+      epoch: 20
+      value: 0.0
+    keep_anchor_constant: false
+    unified:
+      num_neighbors: 4
+      epsilon: 0.01
+
+dynamic_sampling:
+  enabled: false
+  virtual_epoch_size: 100000
+  sigma_ratio: 0.01
+
+rendering:
+  target_faces: 200
+  mode: "cpu"
+  resolution: 256
+
+system:
+  device: "cuda"
+  quick_test: true  # CRITICAL: Enables quick test mode
+  seed: 42

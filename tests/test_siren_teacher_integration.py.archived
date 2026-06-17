@@ -1,0 +1,282 @@
+"""
+SIREN Teacher Network Integration Tests
+
+Test suite for verifying SIREN teacher integration with MA-IUVF training.
+Tests cover isolation properties, normal quality, and tangent space projection.
+"""
+
+import pytest
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from pathlib import Path
+import sys
+
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.models.sdf_network import SDFNetworkSIREN
+from src.models.metric_aligned_iuv_field import MetricAlignedIUVField, create_model
+from src.training.metric_aligned_iuv_losses import compute_metric_aligned_iuv_loss
+
+
+def create_frozen_siren_teacher(device="cuda" if torch.cuda.is_available() else "cpu"):
+    """Create a frozen SIREN teacher for testing"""
+    teacher = SDFNetworkSIREN(
+        hidden_dim=128,
+        num_layers=5,
+        omega_0=3.0,
+    ).to(device)
+
+    # Initialize with dummy weights (for testing only)
+    # In real training, these would be pre-trained weights
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad = False
+
+    return teacher
+
+
+def get_siren_normals(siren_teacher, positions):
+    """Get smooth normals from SIREN teacher with graph truncation"""
+    with torch.enable_grad():
+        # Clone positions and enable gradients
+        positions_with_grad = positions.clone().detach()
+        positions_with_grad.requires_grad_(True)
+
+        # Get SDF values
+        sdf_vals = siren_teacher(positions_with_grad)
+
+        # Compute normals via autograd (create_graph=False truncates graph)
+        normals_smooth = torch.autograd.grad(
+            outputs=sdf_vals,
+            inputs=positions_with_grad,
+            grad_outputs=torch.ones_like(sdf_vals),
+            create_graph=False,  # ← CRITICAL: No gradient backprop to teacher
+        )[0]
+
+        # Normalize and detach (break computation graph completely)
+        normals = torch.nn.functional.normalize(
+            normals_smooth, dim=-1, eps=1e-6
+        ).detach()
+
+    return normals
+
+
+def generate_unit_sphere_samples(n=1000, device="cuda" if torch.cuda.is_available() else "cpu"):
+    """Generate samples on unit sphere for testing"""
+    # Sample random points
+    theta = torch.rand(n, device=device) * 2 * 3.14159
+    phi = torch.acos(2 * torch.rand(n, device=device) - 1)
+
+    x = torch.sin(phi) * torch.cos(theta)
+    y = torch.sin(phi) * torch.sin(theta)
+    z = torch.cos(phi)
+
+    positions = torch.stack([x, y, z], dim=1)
+    return positions
+
+
+def test_siren_teacher_isolation():
+    """Test that SIREN teacher gradients don't backprop to teacher"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Setup
+    siren_teacher = create_frozen_siren_teacher(device)
+
+    # Create a simple MA-IUVF-like model
+    model = nn.Sequential(
+        nn.Linear(3, 64),
+        nn.ReLU(),
+        nn.Linear(64, 2)
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    # Forward pass with teacher
+    positions = torch.randn(100, 3, requires_grad=True, device=device)
+
+    # Get normals from teacher (with graph truncation)
+    normals = get_siren_normals(siren_teacher, positions)
+
+    # Use normals in model forward
+    uv_pred = model(positions)
+    loss = torch.mean((uv_pred - normals[:, :2]) ** 2)
+
+    # Backward
+    optimizer.zero_grad()
+    loss.backward()
+
+    # CRITICAL: Teacher parameters should have NO gradients
+    for param in siren_teacher.parameters():
+        assert param.grad is None, "Teacher gradients leaked!"
+
+    # Model parameters should have gradients
+    for param in model.parameters():
+        assert param.grad is not None, "Model gradients missing!"
+
+    print("✅ Teacher isolation test passed")
+
+
+def test_siren_normals_quality():
+    """Test that SIREN normals are smooth and normalized"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    siren_teacher = create_frozen_siren_teacher(device)
+
+    # Test on unit sphere
+    positions = generate_unit_sphere_samples(n=1000, device=device)
+    normals = get_siren_normals(siren_teacher, positions)
+
+    # Check normalization
+    norms = torch.norm(normals, dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), \
+        "Normals not properly normalized"
+
+    # Check smoothness (low variance)
+    variance = normals.std(dim=0).mean()
+    assert variance < 0.5, f"Normals too noisy (variance={variance})"
+
+    # Check direction (should match radial direction for sphere)
+    radial = positions / torch.norm(positions, dim=-1, keepdim=True)
+    cosine = torch.sum(normals * radial, dim=-1)
+
+    # Note: With untrained weights, we don't expect perfect alignment
+    # But we should have some reasonable directionality
+    assert cosine.abs().mean() > 0.1, "Normals have no directional consistency"
+
+    print(f"✅ Normal quality test passed (cosine={cosine.abs().mean():.4f})")
+
+
+def test_tangent_space_projection():
+    """Test tangent space projection with SIREN normals"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Setup
+    siren_teacher = create_frozen_siren_teacher(device)
+
+    # Create a differentiable UV model
+    model = nn.Sequential(
+        nn.Linear(3, 64),
+        nn.ReLU(),
+        nn.Linear(64, 2)
+    ).to(device)
+
+    # Generate test data
+    positions = generate_unit_sphere_samples(n=100, device=device)
+    positions.requires_grad = True
+
+    # Get normals from teacher
+    normals = get_siren_normals(siren_teacher, positions)
+
+    # Forward pass
+    uv_pred = model(positions)
+
+    # Compute UV Jacobian manually
+    grad_u = torch.autograd.grad(
+        outputs=uv_pred[:, 0].sum(),
+        inputs=positions,
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+    grad_v = torch.autograd.grad(
+        outputs=uv_pred[:, 1].sum(),
+        inputs=positions,
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+    jacobian = torch.stack([grad_u, grad_v], dim=1)  # [B, 2, 3]
+
+    # Project to tangent space: J_tangent = J · (I - n·n^T)
+    normal_outer = torch.bmm(normals.unsqueeze(2), normals.unsqueeze(1))
+    identity = torch.eye(3, device=device).unsqueeze(0).expand(len(normals), -1, -1)
+    P = identity - normal_outer
+
+    jacobian_tangent = torch.bmm(jacobian, P)
+
+    # Verify projection: J_tangent · n should be ≈ 0
+    projection = torch.bmm(jacobian_tangent, normals.unsqueeze(2))
+
+    # Check orthogonality (should be close to zero)
+    max_projection = projection.abs().max().item()
+    assert max_projection < 1e-4, f"Tangent space projection failed (max={max_projection})"
+
+    print(f"✅ Tangent space projection test passed (max_projection={max_projection:.2e})")
+
+
+def test_normal_gradient_regularization():
+    """Test normal gradient regularization computation"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Setup
+    siren_teacher = create_frozen_siren_teacher(device)
+
+    model = nn.Sequential(
+        nn.Linear(3, 64),
+        nn.ReLU(),
+        nn.Linear(64, 2)
+    ).to(device)
+
+    # Generate test data
+    positions = torch.randn(100, 3, device=device)
+    positions.requires_grad = True
+
+    # Get normals from teacher
+    normals = get_siren_normals(siren_teacher, positions)
+
+    # Forward pass
+    uv_pred = model(positions)
+
+    # Compute Jacobian
+    grad_u = torch.autograd.grad(
+        outputs=uv_pred[:, 0].sum(),
+        inputs=positions,
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+    grad_v = torch.autograd.grad(
+        outputs=uv_pred[:, 1].sum(),
+        inputs=positions,
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+    jacobian = torch.stack([grad_u, grad_v], dim=1)  # [B, 2, 3]
+
+    # Compute normal component: J_normal = J · n
+    j_normal = torch.bmm(jacobian, normals.unsqueeze(2))  # [B, 2, 1]
+
+    # Normal regularization: L = ||J_normal||²
+    L_normal_reg = torch.mean(j_normal ** 2)
+
+    # Check that regularization is finite and non-negative
+    assert torch.isfinite(L_normal_reg), "Normal regularization is not finite"
+    assert L_normal_reg.item() >= 0, "Normal regularization is negative"
+
+    print(f"✅ Normal gradient regularization test passed (L={L_normal_reg.item():.6f})")
+
+
+if __name__ == "__main__":
+    print("Running SIREN Teacher Integration Tests...")
+    print()
+
+    try:
+        test_siren_teacher_isolation()
+        test_siren_normals_quality()
+        test_tangent_space_projection()
+        test_normal_gradient_regularization()
+
+        print()
+        print("=" * 60)
+        print("All tests passed! ✅")
+        print("=" * 60)
+    except AssertionError as e:
+        print()
+        print("=" * 60)
+        print(f"Test failed: {e}")
+        print("=" * 60)
+        raise

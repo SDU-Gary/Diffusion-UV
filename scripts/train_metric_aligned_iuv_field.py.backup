@@ -1,0 +1,869 @@
+"""
+MA-IUVF 训练脚本
+
+训练多chart分支隐式UV场
+"""
+
+import argparse
+import sys
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from pathlib import Path
+import logging
+import json
+import csv
+from typing import Dict
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+# 添加项目路径
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.models.metric_aligned_iuv_field import MetricAlignedIUVField, create_model
+from src.data.metric_aligned_iuv_baker import load_baked_data, MetricAlignedIUVSampleData
+from src.data.gpu_constant_baker import is_mesh_constants_dict, load_mesh_constants
+from src.data.gpu_dataset import GPUDynamicSampleGenerator
+from src.training.metric_aligned_iuv_losses import compute_metric_aligned_iuv_loss
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+class MetricAlignedIUVDataset(Dataset):
+    """MA-IUVF数据集"""
+
+    def __init__(self, data: MetricAlignedIUVSampleData):
+        """
+        Args:
+            data: 烘焙数据
+        """
+        self.data = data
+
+    def __len__(self):
+        return len(self.data.pos)
+
+    def __getitem__(self, idx):
+        return {
+            'pos': self.data.pos[idx],
+            'j_3d_gt': self.data.j_3d_gt[idx],
+            'uv_anchor': self.data.uv_anchor[idx],
+            'chart_id': self.data.chart_id[idx],
+        }
+
+
+def detect_data_format(path: str, requested: str = "auto") -> str:
+    """Detect whether ``path`` contains static samples or mesh constants."""
+    if requested != "auto":
+        return requested
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(data, dict) and is_mesh_constants_dict(data):
+        return "mesh_constants"
+    return "baked"
+
+
+def compute_loss_schedule(
+    epoch: int,
+    total_epochs: int,
+    base_metric_weight: float,
+    base_anchor_weight: float,
+    base_cls_weight: float,
+    base_com_weight: float = 0.0,
+    schedule_name: str = "fixed",
+    phase_a_epochs: int = 30,
+    target_metric_weight: float = 1.0,
+    target_anchor_weight: float = 0.01,
+    target_cls_weight: float = 0.1,
+    ramp: str = "cosine",
+) -> Dict[str, float]:
+    """Return loss weights for a 1-based epoch.
+
+    ``two_stage`` keeps the initial weights during Phase A, then smoothly
+    decreases anchor/classification pressure while increasing metric pressure.
+    Anchor uses log-space interpolation so 1.0 -> 0.01 decays multiplicatively.
+    """
+    if schedule_name == "fixed":
+        return {
+            "metric_weight": float(base_metric_weight),
+            "anchor_weight": float(base_anchor_weight),
+            "com_weight": float(base_com_weight),
+            "cls_weight": float(base_cls_weight),
+        }
+    if schedule_name != "two_stage":
+        raise ValueError(f"未知loss schedule: {schedule_name}")
+
+    if epoch <= phase_a_epochs or total_epochs <= phase_a_epochs:
+        t = 0.0
+    else:
+        denom = max(1, total_epochs - phase_a_epochs)
+        t = min(1.0, max(0.0, (epoch - phase_a_epochs) / denom))
+
+    if ramp == "linear":
+        alpha = t
+    elif ramp == "cosine":
+        alpha = 0.5 - 0.5 * math.cos(math.pi * t)
+    else:
+        raise ValueError(f"未知schedule ramp: {ramp}")
+
+    def lerp(a: float, b: float) -> float:
+        return float(a + (b - a) * alpha)
+
+    def log_lerp(a: float, b: float) -> float:
+        a = max(float(a), 1e-12)
+        b = max(float(b), 1e-12)
+        return float(math.exp(math.log(a) + (math.log(b) - math.log(a)) * alpha))
+
+    return {
+        "metric_weight": lerp(base_metric_weight, target_metric_weight),
+        "anchor_weight": log_lerp(base_anchor_weight, target_anchor_weight),
+        "com_weight": float(base_com_weight),
+        "cls_weight": lerp(base_cls_weight, target_cls_weight),
+    }
+
+
+def train_batch(
+    model: MetricAlignedIUVField,
+    batch: Dict[str, torch.Tensor],
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    metric_weight: float,
+    anchor_weight: float,
+    cls_weight: float,
+    com_weight: float = 0.0,
+    use_tangent_space: bool = False,
+    siren_teacher=None,
+    lambda_normal_reg=0.05,
+) -> Dict[str, float]:
+    """Train on one batch from either static baked data or dynamic sampling."""
+    pos = batch['pos'].to(device)  # [B, 3]
+    j_3d_gt = batch['j_3d_gt'].to(device)  # [B, 2, 3]
+    uv_anchor = batch['uv_anchor'].to(device)  # [B, 2]
+    chart_id = batch['chart_id'].to(device)  # [B]
+
+    # Get normals - either from SIREN teacher or mesh data
+    if siren_teacher is not None:
+        # === NEW: Get smooth normals from SIREN teacher ===
+        with torch.enable_grad():
+            # Clone positions and enable gradients
+            positions_with_grad = pos.clone().detach()
+            positions_with_grad.requires_grad_(True)
+
+            # Get SDF values
+            sdf_vals = siren_teacher(positions_with_grad)
+
+            # Compute normals via autograd (create_graph=False truncates graph)
+            normals_smooth = torch.autograd.grad(
+                outputs=sdf_vals,
+                inputs=positions_with_grad,
+                grad_outputs=torch.ones_like(sdf_vals),
+                create_graph=False,  # ← CRITICAL: No gradient backprop to teacher
+            )[0]
+
+            # Normalize and detach (break computation graph completely)
+            normals_siren = torch.nn.functional.normalize(
+                normals_smooth, dim=-1, eps=1e-6
+            ).detach()
+
+        # Use SIREN normals instead of mesh normals
+        normals = normals_siren
+    else:
+        # Fall back to mesh normals
+        normals = batch.get('normals')
+        if normals is not None:
+            normals = normals.to(device)  # [B, 3]
+
+    # MA-IUVF metric supervision needs dUV/dpos. Detach sampled coordinates
+    # from the sampling graph so we only optimize the neural field parameters.
+    pos = pos.clone().detach().requires_grad_(True)
+
+    model_output = model(pos)
+
+    pred_chart_id = model_output.logits.argmax(-1)  # [B]
+    cls_correct = (pred_chart_id == chart_id).sum().item()
+
+    loss_dict = compute_metric_aligned_iuv_loss(
+        model_output=model_output,
+        pos=pos,
+        j_3d_gt=j_3d_gt,
+        uv_anchor=uv_anchor,
+        chart_id=chart_id,
+        normals=normals,  # NEW
+        use_tangent_space=use_tangent_space,  # NEW
+        metric_weight=metric_weight,
+        anchor_weight=anchor_weight,
+        com_weight=com_weight,
+        cls_weight=cls_weight,
+    )
+
+    loss = loss_dict['total']
+
+    # === NEW: Normal gradient regularization ===
+    if siren_teacher is not None and use_tangent_space and normals is not None:
+        # Prevent normal space gradients from growing uncontrollably
+        # Compute UV Jacobian for normal component
+        uv_preds = model_output.uv_preds  # [B, C, 2] - all chart predictions
+        selected_uv = torch.gather(
+            uv_preds,
+            1,
+            chart_id.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 2)
+        ).squeeze(1)  # [B, 2]
+
+        # Compute Jacobian: dUV/dpos
+        grad_u = torch.autograd.grad(
+            outputs=selected_uv[:, 0].sum(),
+            inputs=pos,
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        grad_v = torch.autograd.grad(
+            outputs=selected_uv[:, 1].sum(),
+            inputs=pos,
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        jacobian = torch.stack([grad_u, grad_v], dim=1)  # [B, 2, 3]
+
+        # Normal component: J_normal = J · n
+        j_normal = torch.bmm(jacobian, normals.unsqueeze(2))  # [B, 2, 1]
+        L_normal_reg = torch.mean(j_normal ** 2)
+
+        loss = loss + lambda_normal_reg * L_normal_reg
+        loss_dict['normal_reg'] = L_normal_reg.item()
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+
+    return {
+        'loss': float(loss.item()),
+        'metric': float(loss_dict['metric'].item()),
+        'anchor': float(loss_dict['anchor'].item()),
+        'com': float(loss_dict['com'].item()),
+        'cls': float(loss_dict['cls'].item()),
+        'cls_correct': float(cls_correct),
+        'cls_samples': float(len(chart_id)),
+        'normal_reg': float(loss_dict.get('normal_reg', 0.0)),  # NEW
+    }
+
+
+def train_epoch(
+    model: MetricAlignedIUVField,
+    dataloader: DataLoader,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    metric_weight: float,
+    anchor_weight: float,
+    cls_weight: float,
+    com_weight: float = 0.0,
+    use_tangent_space: bool = False,
+    siren_teacher=None,
+    lambda_normal_reg=0.05,
+) -> Dict[str, float]:
+    """
+    训练一个epoch
+
+    Args:
+        model: 模型
+        dataloader: 数据加载器
+        optimizer: 优化器
+        device: 设备
+        metric_weight: metric loss权重
+        anchor_weight: anchor loss权重
+        com_weight: 质心对齐 loss 权重
+        cls_weight: 分类loss权重
+        use_tangent_space: 是否使用切空间投影
+
+    Returns:
+        epoch_metrics: 平均指标
+    """
+    model.train()
+
+    total_loss = 0.0
+    total_metric = 0.0
+    total_anchor = 0.0
+    total_com = 0.0
+    total_cls = 0.0
+    total_cls_correct = 0
+    total_cls_samples = 0
+
+    num_batches = 0
+
+    for batch in tqdm(dataloader, desc="Training"):
+        metrics = train_batch(
+            model=model,
+            batch=batch,
+            optimizer=optimizer,
+            device=device,
+            metric_weight=metric_weight,
+            anchor_weight=anchor_weight,
+            com_weight=com_weight,
+            cls_weight=cls_weight,
+            use_tangent_space=use_tangent_space,
+            siren_teacher=siren_teacher,  # NEW
+            lambda_normal_reg=lambda_normal_reg,  # NEW
+        )
+        total_cls_correct += metrics['cls_correct']
+        total_cls_samples += metrics['cls_samples']
+        total_loss += metrics['loss']
+        total_metric += metrics['metric']
+        total_anchor += metrics['anchor']
+        total_com += metrics['com']
+        total_cls += metrics['cls']
+        num_batches += 1
+
+    # 平均
+    cls_acc = total_cls_correct / total_cls_samples if total_cls_samples > 0 else 0.0
+    epoch_metrics = {
+        'loss': total_loss / num_batches,
+        'metric': total_metric / num_batches,
+        'anchor': total_anchor / num_batches,
+        'com': total_com / num_batches,
+        'cls': total_cls / num_batches,
+        'cls_acc': cls_acc,
+        'normal_reg': metrics.get('normal_reg', 0.0),  # NEW
+    }
+
+    return epoch_metrics
+
+
+def train_epoch_dynamic(
+    model: MetricAlignedIUVField,
+    generator: GPUDynamicSampleGenerator,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    metric_weight: float,
+    anchor_weight: float,
+    cls_weight: float,
+    steps_per_epoch: int,
+    com_weight: float = 0.0,
+    use_tangent_space: bool = False,
+    siren_teacher=None,
+    lambda_normal_reg=0.05,
+) -> Dict[str, float]:
+    """Train one virtual epoch using on-the-fly GPU samples."""
+    model.train()
+
+    total_loss = 0.0
+    total_metric = 0.0
+    total_anchor = 0.0
+    total_com = 0.0
+    total_cls = 0.0
+    total_cls_correct = 0.0
+    total_cls_samples = 0.0
+
+    for _ in tqdm(range(steps_per_epoch), desc="Training"):
+        batch = generator.next_batch()
+        metrics = train_batch(
+            model=model,
+            batch=batch,
+            optimizer=optimizer,
+            device=device,
+            metric_weight=metric_weight,
+            anchor_weight=anchor_weight,
+            com_weight=com_weight,
+            cls_weight=cls_weight,
+            use_tangent_space=use_tangent_space,
+            siren_teacher=siren_teacher,  # NEW
+            lambda_normal_reg=lambda_normal_reg,  # NEW
+        )
+        total_loss += metrics['loss']
+        total_metric += metrics['metric']
+        total_anchor += metrics['anchor']
+        total_com += metrics['com']
+        total_cls += metrics['cls']
+        total_cls_correct += metrics['cls_correct']
+        total_cls_samples += metrics['cls_samples']
+
+    cls_acc = total_cls_correct / total_cls_samples if total_cls_samples > 0 else 0.0
+    return {
+        'loss': total_loss / steps_per_epoch,
+        'metric': total_metric / steps_per_epoch,
+        'anchor': total_anchor / steps_per_epoch,
+        'com': total_com / steps_per_epoch,
+        'cls': total_cls / steps_per_epoch,
+        'cls_acc': cls_acc,
+        'normal_reg': metrics.get('normal_reg', 0.0),  # NEW
+    }
+
+
+def save_checkpoint(
+    model: MetricAlignedIUVField,
+    optimizer: optim.Optimizer,
+    epoch: int,
+    loss: float,
+    best_loss: float,
+    cls_acc: float,
+    best_cls_acc: float,
+    output_path: Path,
+    baker_metadata: Dict,
+    loss_schedule: Dict = None,
+):
+    """
+    保存checkpoint
+
+    Args:
+        model: 模型
+        optimizer: 优化器
+        epoch: 当前epoch
+        loss: 当前loss
+        best_loss: 历史最佳loss
+        cls_acc: 当前分类准确率
+        best_cls_acc: 历史最佳分类准确率
+        output_path: 输出路径
+        baker_metadata: 烘焙元数据
+    """
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'loss': loss,
+        'cls_acc': cls_acc,
+        'best_cls_acc': best_cls_acc,
+        'best_loss': best_loss,
+        'num_charts': model.num_charts,
+        'hidden_dim': model.hidden_dim,
+        'num_layers': model.num_layers,
+        'positional_encoding_freqs': model.positional_encoding_freqs,
+        'encoder_type': model.encoder_type,
+        'activation': model.activation,
+        'hash_num_levels': model.hash_num_levels,
+        'hash_features_per_level': model.hash_features_per_level,
+        'hash_log2_size': model.hash_log2_size,
+        'hash_base_res': model.hash_base_res,
+        'hash_max_res': model.hash_max_res,
+        'hash_cuda_backend': model.hash_cuda_backend,
+        'baker_metadata': baker_metadata,
+        'texture_path': baker_metadata.get('texture_path', None),
+    }
+    if loss_schedule is not None:
+        checkpoint['loss_schedule'] = loss_schedule
+
+    torch.save(checkpoint, output_path)
+    logger.info(f"保存checkpoint: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="MA-IUVF训练脚本",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # 数据参数
+    parser.add_argument("--data", required=True, help="烘焙数据路径 (.pt)")
+    parser.add_argument(
+        "--data-format",
+        choices=["auto", "baked", "mesh_constants"],
+        default="auto",
+        help="训练数据格式：旧静态点云或新 mesh constants",
+    )
+    parser.add_argument("--output-dir", required=True, help="输出目录")
+
+    # 训练参数
+    parser.add_argument("--epochs", type=int, default=100, help="训练轮数")
+    parser.add_argument("--batch-size", type=int, default=8192, help="批大小")
+    parser.add_argument("--lr", type=float, default=1e-3, help="MLP学习率")
+    parser.add_argument("--hash-lr", type=float, default=None, help="Hash Grid学习率（默认同--lr）")
+    parser.add_argument("--device", default="cuda", help="设备")
+
+    # 模型参数
+    parser.add_argument("--hidden-dim", type=int, default=64, help="隐藏层维度")
+    parser.add_argument("--num-layers", type=int, default=2, help="MLP层数")
+    parser.add_argument("--positional-enc-freqs", type=int, default=8, help="位置编码频率数")
+    parser.add_argument("--encoder-type", choices=["fourier", "bspline_hash"], default="bspline_hash", help="空间编码器")
+    parser.add_argument("--activation", choices=["softplus", "silu", "relu"], default="silu", help="MLP激活函数")
+    parser.add_argument("--hash-num-levels", type=int, default=16, help="Hash Grid层级数")
+    parser.add_argument("--hash-features-per-level", type=int, default=2, help="每层Hash特征维度")
+    parser.add_argument("--hash-log2-size", type=int, default=19, help="每层Hash表大小log2")
+    parser.add_argument("--hash-base-res", type=int, default=16, help="Hash Grid基础分辨率")
+    parser.add_argument("--hash-max-res", type=int, default=2048, help="Hash Grid最高分辨率")
+    parser.add_argument("--hash-cuda-backend", choices=["auto", "torch", "cuda"], default="auto", help="Hash Grid CUDA后端")
+
+    # Loss权重
+    parser.add_argument("--metric-weight", type=float, default=0.01, help="metric loss权重")
+    parser.add_argument("--anchor-weight", type=float, default=1.0, help="anchor loss权重")
+    parser.add_argument("--com-weight", type=float, default=0.0, help="chart-wise 质心对齐 loss 权重")
+    parser.add_argument("--cls-weight", type=float, default=1.0, help="分类loss权重")
+    parser.add_argument(
+        "--loss-schedule",
+        choices=["fixed", "two_stage"],
+        default="fixed",
+        help="Loss 权重调度。fixed 保持常量；two_stage 先定位再提升 metric",
+    )
+    parser.add_argument("--phase-a-epochs", type=int, default=30, help="two_stage 宏观定位期 epoch 数")
+    parser.add_argument("--target-metric-weight", type=float, default=1.0, help="two_stage 结束时 metric 权重")
+    parser.add_argument("--target-anchor-weight", type=float, default=0.01, help="two_stage 结束时 anchor 权重")
+    parser.add_argument("--target-cls-weight", type=float, default=0.1, help="two_stage 结束时 cls 权重")
+    parser.add_argument(
+        "--schedule-ramp",
+        choices=["cosine", "linear"],
+        default="cosine",
+    )
+    parser.add_argument(
+        "--use-tangent-space",
+        action="store_true",
+        help="Use tangent space projection for metric loss (reduces normal gradient noise)",
+    )
+
+    # SIREN Teacher Network for smooth normals
+    parser.add_argument(
+        "--use-siren-teacher",
+        action="store_true",
+        help="Use pre-trained SIREN SDF network to provide C∞ smooth normals (eliminates gradient pollution)",
+    )
+    parser.add_argument(
+        "--sdf-teacher-checkpoint",
+        type=str,
+        help="Path to pre-trained SIREN SDF checkpoint (e.g., outputs/sdf_siren_50epochs/best.pt)",
+    )
+    parser.add_argument(
+        "--lambda-normal-reg",
+        type=float,
+        default=0.05,
+        help="Normal gradient regularization weight (prevents uncontrolled normal space growth)",
+    )
+
+    parser.add_argument("--hash-weight-decay", type=float, default=1e-6, help="Hash Grid weight decay")
+    parser.add_argument("--mlp-weight-decay", type=float, default=0.0, help="MLP/head weight decay")
+
+    # 其他
+    parser.add_argument(
+        "--virtual-epoch-size",
+        type=int,
+        default=300000,
+        help="mesh_constants 动态采样模式下，每个 epoch 的虚拟样本数",
+    )
+    parser.add_argument("--sigma", type=float, default=None, help="动态采样法向挤出 sigma 绝对值")
+    parser.add_argument("--sigma-ratio", type=float, default=None, help="动态采样法向挤出 sigma/bbox_diag 覆盖值")
+    parser.add_argument("--sampling-seed", type=int, default=None, help="动态采样随机种子")
+    parser.add_argument("--log-interval", type=int, default=10, help="日志间隔")
+
+    args = parser.parse_args()
+
+    # 设备
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    logger.info(f"设备: {device}")
+
+    # 创建输出目录
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 加载数据
+    logger.info(f"加载数据: {args.data}")
+    data_format = detect_data_format(args.data, args.data_format)
+    logger.info(f"数据格式: {data_format}")
+
+    dataloader = None
+    data_generator = None
+    steps_per_epoch = None
+
+    if data_format == "mesh_constants":
+        constants_cpu, baker_metadata = load_mesh_constants(args.data, map_location="cpu")
+        logger.info(
+            "GPU动态采样常量: %d faces, %d charts",
+            int(constants_cpu["face_vertices"].shape[0]),
+            int(baker_metadata["num_charts"]),
+        )
+        data_generator = GPUDynamicSampleGenerator(
+            mesh_constants_path=args.data,
+            batch_size=args.batch_size,
+            sigma=args.sigma,
+            sigma_ratio=args.sigma_ratio,
+            device=device,
+            seed=args.sampling_seed,
+        )
+        steps_per_epoch = max(1, (int(args.virtual_epoch_size) + args.batch_size - 1) // args.batch_size)
+        logger.info(
+            "动态采样: virtual_epoch_size=%d, steps_per_epoch=%d, sigma=%.6g",
+            int(args.virtual_epoch_size),
+            steps_per_epoch,
+            data_generator.sigma,
+        )
+    else:
+        data, baker_metadata = load_baked_data(args.data)
+        logger.info(f"数据: {len(data.pos)}样本, {baker_metadata['num_charts']}charts")
+
+        # 创建数据集和加载器
+        dataset = MetricAlignedIUVDataset(data)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,  # 简化：单进程
+        )
+
+    # 如果baker metadata中有texture_path，使用它
+    texture_path = baker_metadata.get('texture_path', None)
+    if texture_path:
+        logger.info(f"纹理: {texture_path}")
+
+    # 创建模型
+    num_charts = baker_metadata['num_charts']
+    model = create_model(
+        num_charts=num_charts,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        positional_encoding_freqs=args.positional_enc_freqs,
+        encoder_type=args.encoder_type,
+        hash_num_levels=args.hash_num_levels,
+        hash_features_per_level=args.hash_features_per_level,
+        hash_log2_size=args.hash_log2_size,
+        hash_base_res=args.hash_base_res,
+        hash_max_res=args.hash_max_res,
+        hash_cuda_backend=args.hash_cuda_backend,
+        bbox_min=baker_metadata.get('bbox_min'),
+        bbox_max=baker_metadata.get('bbox_max'),
+        activation=args.activation,
+    )
+    model.to(device)
+
+    # Initialize SIREN teacher if specified
+    siren_teacher = None
+    if args.use_siren_teacher and args.sdf_teacher_checkpoint:
+        from src.models.sdf_network import SDFNetworkSIREN
+
+        logger.info("Loading SIREN teacher for smooth normals...")
+        siren_teacher = SDFNetworkSIREN(
+            hidden_dim=128,
+            num_layers=5,
+            omega_0=3.0,
+        ).to(device)
+
+        # Load pre-trained weights
+        checkpoint = torch.load(args.sdf_teacher_checkpoint, map_location=device)
+        siren_teacher.load_state_dict(checkpoint['model_state_dict'])
+
+        # CRITICAL: Freeze teacher completely
+        siren_teacher.eval()
+        for param in siren_teacher.parameters():
+            param.requires_grad = False
+
+        logger.info(f"SIREN teacher loaded and frozen: {siren_teacher.get_num_params():,} parameters")
+        logger.info(f"Teacher checkpoint: {args.sdf_teacher_checkpoint}")
+    elif args.use_siren_teacher and not args.sdf_teacher_checkpoint:
+        raise ValueError("--use-siren-teacher requires --sdf-teacher-checkpoint")
+
+    # 优化器
+    optimizer = optim.Adam(
+        model.get_optimizer_param_groups(
+            lr=args.lr,
+            hash_lr=args.hash_lr,
+            hash_weight_decay=args.hash_weight_decay,
+            mlp_weight_decay=args.mlp_weight_decay,
+        )
+    )
+
+    # 训练日志
+    log_file = output_dir / "train_loss.csv"
+    with open(log_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'epoch',
+            'loss',
+            'metric',
+            'anchor',
+            'com',
+            'cls',
+            'cls_acc',
+            'metric_weight',
+            'anchor_weight',
+            'com_weight',
+            'cls_weight',
+        ])
+
+    # 训练循环
+    best_loss = float('inf')
+    best_cls_acc = 0.0
+    loss_schedule_config = {
+        "name": args.loss_schedule,
+        "base_metric_weight": args.metric_weight,
+        "base_anchor_weight": args.anchor_weight,
+        "base_com_weight": args.com_weight,
+        "base_cls_weight": args.cls_weight,
+        "phase_a_epochs": args.phase_a_epochs,
+        "target_metric_weight": args.target_metric_weight,
+        "target_anchor_weight": args.target_anchor_weight,
+        "target_cls_weight": args.target_cls_weight,
+        "ramp": args.schedule_ramp,
+    }
+    with open(output_dir / "loss_schedule.json", "w") as f:
+        json.dump(loss_schedule_config, f, indent=2)
+
+    for epoch in range(args.epochs):
+        epoch_num = epoch + 1
+        current_weights = compute_loss_schedule(
+            epoch=epoch_num,
+            total_epochs=args.epochs,
+            base_metric_weight=args.metric_weight,
+            base_anchor_weight=args.anchor_weight,
+            base_com_weight=args.com_weight,
+            base_cls_weight=args.cls_weight,
+            schedule_name=args.loss_schedule,
+            phase_a_epochs=args.phase_a_epochs,
+            target_metric_weight=args.target_metric_weight,
+            target_anchor_weight=args.target_anchor_weight,
+            target_cls_weight=args.target_cls_weight,
+            ramp=args.schedule_ramp,
+        )
+        metric_weight = current_weights["metric_weight"]
+        anchor_weight = current_weights["anchor_weight"]
+        com_weight = current_weights["com_weight"]
+        cls_weight = current_weights["cls_weight"]
+
+        logger.info(f"\nEpoch {epoch_num}/{args.epochs}")
+        logger.info(
+            "Loss weights | Metric: %.6g | Anchor: %.6g | CoM: %.6g | Cls: %.6g",
+            metric_weight,
+            anchor_weight,
+            com_weight,
+            cls_weight,
+        )
+
+        # 训练
+        if data_format == "mesh_constants":
+            metrics = train_epoch_dynamic(
+                model=model,
+                generator=data_generator,
+                optimizer=optimizer,
+                device=device,
+                metric_weight=metric_weight,
+                anchor_weight=anchor_weight,
+                com_weight=com_weight,
+                cls_weight=cls_weight,
+                steps_per_epoch=steps_per_epoch,
+                use_tangent_space=args.use_tangent_space,  # NEW
+                siren_teacher=siren_teacher,  # NEW
+                lambda_normal_reg=args.lambda_normal_reg,  # NEW
+            )
+        else:
+            metrics = train_epoch(
+                model=model,
+                dataloader=dataloader,
+                optimizer=optimizer,
+                device=device,
+                metric_weight=metric_weight,
+                anchor_weight=anchor_weight,
+                com_weight=com_weight,
+                cls_weight=cls_weight,
+                use_tangent_space=args.use_tangent_space,  # NEW
+                siren_teacher=siren_teacher,  # NEW
+                lambda_normal_reg=args.lambda_normal_reg,  # NEW
+            )
+
+        logger.info(
+            f"Loss: {metrics['loss']:.6f} | "
+            f"Metric: {metrics['metric']:.6f} | "
+            f"Anchor: {metrics['anchor']:.6f} | "
+            f"CoM: {metrics['com']:.6f} | "
+            f"Cls: {metrics['cls']:.6f} | "
+            f"ClsAcc: {metrics['cls_acc']:.4f} | "
+            f"NormalReg: {metrics.get('normal_reg', 0.0):.6f}"  # NEW
+        )
+
+        # 保存日志
+        with open(log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch_num,
+                metrics['loss'],
+                metrics['metric'],
+                metrics['anchor'],
+                metrics['com'],
+                metrics['cls'],
+                metrics['cls_acc'],
+                metric_weight,
+                anchor_weight,
+                com_weight,
+                cls_weight,
+            ])
+
+        # 更新最佳分类准确率
+        if metrics['cls_acc'] > best_cls_acc:
+            best_cls_acc = metrics['cls_acc']
+            logger.info(f"🎯 新的最佳分类准确率: {best_cls_acc:.4f}")
+
+        # 保存checkpoint (基于loss)
+        if metrics['loss'] < best_loss:
+            best_loss = metrics['loss']
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                loss=metrics['loss'],
+                best_loss=best_loss,
+                cls_acc=metrics['cls_acc'],
+                best_cls_acc=best_cls_acc,
+                output_path=output_dir / "best.pt",
+                baker_metadata=baker_metadata,
+                loss_schedule={
+                    **loss_schedule_config,
+                    "epoch": epoch_num,
+                    "current_weights": current_weights,
+                },
+            )
+
+        # 定期保存
+        if (epoch + 1) % 10 == 0:
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                loss=metrics['loss'],
+                best_loss=best_loss,
+                cls_acc=metrics['cls_acc'],
+                best_cls_acc=best_cls_acc,
+                output_path=output_dir / f"epoch_{epoch + 1}.pt",
+                baker_metadata=baker_metadata,
+                loss_schedule={
+                    **loss_schedule_config,
+                    "epoch": epoch_num,
+                    "current_weights": current_weights,
+                },
+            )
+
+    # 保存最终checkpoint
+    save_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        epoch=args.epochs,
+        loss=metrics['loss'],
+        best_loss=best_loss,
+        cls_acc=metrics['cls_acc'],
+        best_cls_acc=best_cls_acc,
+        output_path=output_dir / "final.pt",
+        baker_metadata=baker_metadata,
+        loss_schedule={
+            **loss_schedule_config,
+            "epoch": args.epochs,
+            "current_weights": compute_loss_schedule(
+                epoch=args.epochs,
+                total_epochs=args.epochs,
+                base_metric_weight=args.metric_weight,
+                base_anchor_weight=args.anchor_weight,
+                base_com_weight=args.com_weight,
+                base_cls_weight=args.cls_weight,
+                schedule_name=args.loss_schedule,
+                phase_a_epochs=args.phase_a_epochs,
+                target_metric_weight=args.target_metric_weight,
+                target_anchor_weight=args.target_anchor_weight,
+                target_cls_weight=args.target_cls_weight,
+                ramp=args.schedule_ramp,
+            ),
+        },
+    )
+
+    logger.info(f"\n训练完成! 输出: {output_dir}")
+    logger.info(f"Best loss: {best_loss:.6f}")
+    logger.info(f"Best classification accuracy: {best_cls_acc:.4f}")
+
+
+if __name__ == "__main__":
+    main()

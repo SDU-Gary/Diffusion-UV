@@ -1,0 +1,112 @@
+# =============================================================================
+# Production Training Configuration - Full Scale Training
+# =============================================================================
+
+# Data Configuration
+data:
+  high_mesh_path: "data/models/stanford-bunny.obj"
+  low_mesh_path: ""
+  texture_path: ""
+  cache_dir: "./cache/bunny_production"
+  num_samples_per_epoch: 1000000  # 1M samples per epoch
+  sampling_ratios:
+    surface: 0.4
+    near_surface: 0.4
+    exterior: 0.1
+    interior: 0.1
+  near_surface_epsilon: 0.01
+  lowpass_sigma: 5.0
+
+# Network G: Geometry Network (SDF + Low-freq Color)
+network_g:
+  hidden_dim: 256  # Larger hidden dimension
+  num_layers: 8    # Deeper network
+  positional_encoding_freqs: 6  # More frequency bands
+  skip_connection_layer: 4
+  include_raw_input: true
+  sdf_output_range: 1.0
+
+# Network D: Diffusion Model
+network_d:
+  condition_dim: 42
+  num_diffusion_steps: 1000  # Standard DDPM timesteps
+  inference_steps: 100       # High quality inference
+  scheduler_type: "linear"
+  hidden_channels: 128       # Larger UNet
+  num_down_layers: 2
+  num_res_blocks: 4         # More residual blocks
+  use_film: true
+  film_hidden_dim: 256
+  use_ema: true             # Enable EMA for stability
+  ema_decay: 0.9999
+
+# Network R: Reverse Mapping Network
+network_r:
+  hidden_dim: 128
+  num_layers: 3
+  num_classes: 32
+  positional_encoding_freqs: 4
+
+# Training Configuration
+training:
+  # Production training epochs (from START.md)
+  phase1_epochs: 500   # Train G only
+  phase2_epochs: 200   # Train D only (G frozen)
+  phase3_epochs: 100   # Joint fine-tuning
+
+  # Large batch sizes for GPU training
+  batch_size_phase1: 131072   # 128K samples
+  batch_size_phase2: 65536     # 64K samples
+  batch_size_phase3: 32768     # 32K samples
+
+  # Learning rates
+  learning_rate_g: 1.0e-3
+  learning_rate_d: 1.0e-4
+  learning_rate_r: 1.0e-4
+
+  optimizer: "adam"
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+  mixed_precision: true  # Enable FP16 for GPU
+
+  # Loss weights
+  lambda_sdf: 1.0
+  lambda_eikonal: 0.1
+  lambda_color_base: 1.0
+  lambda_diffusion: 1.0
+  lambda_reverse_start: 0.1
+  lambda_reverse_end: 0.5
+  lambda_entropy_start: 0.0
+  lambda_entropy_end: 0.05
+
+# Loss Configuration
+loss:
+  lambda_sdf: 1.0
+  lambda_eikonal: 0.1
+  lambda_color_base: 1.0
+  lambda_diffusion: 1.0
+  lambda_reverse: 0.1
+  lambda_entropy: 0.0
+
+# Logging Configuration
+logging:
+  log_dir: "./logs"
+  experiment_name: "bunny_production"
+  use_wandb: true         # Enable W&B for production
+  use_tensorboard: false
+  wandb_project: "diffusion-uv"
+  wandb_mode: "online"
+  log_interval: 100       # Log every 100 steps
+  render_interval: 50     # Render every 50 epochs
+  save_interval: 50       # Save checkpoint every 50 epochs
+
+# Evaluation Configuration
+evaluation:
+  eval_interval: 50       # Evaluate every 50 epochs
+  num_render_views: 12    # More render views for evaluation
+  render_resolution: 512  # Higher resolution
+  output_dir: "./outputs"
+
+# Experiment Settings
+seed: 42
+device: "cuda"

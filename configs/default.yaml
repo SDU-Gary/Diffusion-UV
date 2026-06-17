@@ -1,0 +1,153 @@
+# =============================================================================
+# Experiment Configuration
+# =============================================================================
+
+# Data Configuration
+data:
+  high_mesh_path: ""  # Path to high-poly mesh
+  low_mesh_path: ""   # Path to low-poly mesh
+  texture_path: ""     # Path to texture image
+  cache_dir: "./cache"  # Cache directory
+
+  # Sampling configuration
+  num_samples_per_epoch: 2000000  # 2M samples per epoch
+  sampling_ratios:
+    surface: 0.4
+    near_surface: 0.4
+    exterior: 0.1
+    interior: 0.1
+
+  # Near-surface epsilon (relative to bounding box)
+  near_surface_epsilon: 0.01
+
+  # Gaussian filter sigma for low-pass color
+  lowpass_sigma: 5.0  # pixels
+
+# =============================================================================
+# Network Configurations
+# =============================================================================
+
+# Network G: Geometry Network
+# ~0.8M parameters
+network_g:
+  hidden_dim: 256
+  num_layers: 8
+  positional_encoding_freqs: 6
+  skip_connection_layer: 4
+  include_raw_input: true
+  sdf_output_range: 1.0  # tanh range
+
+# Network D: Diffusion Model
+# ~4M parameters
+network_d:
+  condition_dim: 42  # Fixed by design
+  num_diffusion_steps: 1000  # T for training
+  inference_steps: 20  # DDIM steps
+  scheduler_type: "linear"
+
+  # UNet configuration
+  hidden_channels: 64
+  num_down_layers: 3
+  num_res_blocks: 2
+
+  # FiLM conditioning
+  use_film: true
+  film_hidden_dim: 512
+
+  # EMA
+  use_ema: true
+  ema_decay: 0.9999
+
+# Network R: Reverse Mapping Network
+# ~50K parameters
+network_r:
+  hidden_dim: 256
+  num_layers: 4
+  num_classes: 32  # K from K-means clustering
+  positional_encoding_freqs: 6
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+
+training:
+  # Phase durations (epochs)
+  phase1_epochs: 500   # Train G only
+  phase2_epochs: 200   # Train D only (G frozen)
+  phase3_epochs: 100   # Joint fine-tuning
+
+  # Batch sizes (different for each phase)
+  batch_size_phase1: 65536
+  batch_size_phase2: 32768
+  batch_size_phase3: 16384
+
+  # Learning rates
+  learning_rate_g: 5.0e-4
+  learning_rate_d: 1.0e-4
+  learning_rate_r: 1.0e-4
+
+  # Optimizer
+  optimizer: "adamw"
+  weight_decay: 0.0
+
+  # Gradient clipping
+  gradient_clip_norm: 1.0
+
+  # Mixed precision
+  mixed_precision: true
+
+  # Loss weights
+  lambda_sdf: 1.0
+  lambda_eikonal: 0.1
+  lambda_color_base: 1.0
+  lambda_diffusion: 1.0
+  lambda_reverse_start: 0.1
+  lambda_reverse_end: 0.5
+  lambda_entropy_start: 0.0
+  lambda_entropy_end: 0.05
+
+# =============================================================================
+# Loss Configuration
+# =============================================================================
+
+loss:
+  lambda_sdf: 1.0
+  lambda_eikonal: 0.1
+  lambda_color_base: 1.0
+  lambda_diffusion: 1.0
+  lambda_reverse: 0.1
+  lambda_entropy: 0.0
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+
+logging:
+  log_dir: "./logs"
+  experiment_name: "diffusion_uv"
+
+  use_wandb: true
+  use_tensorboard: true
+  wandb_project: "diffusion-uv"
+  wandb_mode: "online"
+
+  log_interval: 100      # steps
+  render_interval: 10      # epochs
+  save_interval: 50       # epochs
+
+# =============================================================================
+# Evaluation Configuration
+# =============================================================================
+
+evaluation:
+  eval_interval: 10
+  num_render_views: 8
+  render_resolution: 512
+  output_dir: "./outputs"
+
+# =============================================================================
+# Experiment Settings
+# =============================================================================
+
+seed: 42
+device: "auto"

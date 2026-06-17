@@ -1,0 +1,82 @@
+# MA-IUVF Baseline Configuration
+# Standard configuration for production experiments
+
+experiment:
+  name: "maiuvf_baseline"
+  description: "Baseline MA-IUVF experiment with default parameters"
+  tags: ["baseline", "production"]
+  version: "1.0"
+
+paths:
+  input_mesh: "data/models/stanford_bunny.obj"
+  texture: "data/textures/bunny_texture.png"
+  output_dir: "outputs/maiuvf_baseline"
+
+baking:
+  num_samples: 100000
+  chart_mode: "uv_islands"
+  use_dynamic_sampling: false
+  virtual_epoch_size: 300000
+  sigma_ratio: 0.01
+
+training:
+  epochs: 100
+  batch_size: 8192
+  learning_rate: 0.001
+  device: "cuda"
+
+model:
+  encoder_type: "bspline_hash"
+  activation: "silu"
+  hidden_dim: 64
+  num_layers: 2
+  positional_encoding_freqs: 8
+  hash_grid:
+    learning_rate: null  # Uses training.learning_rate
+    num_levels: 16
+    features_per_level: 2
+    log2_size: 19
+    base_resolution: 16
+    max_resolution: 2048
+    cuda_backend: "auto"
+    weight_decay: 0.000001
+  mlp:
+    weight_decay: 0.0
+
+loss:
+  weights:
+    metric: 0.01
+    anchor: 1.0
+    classification: 1.0
+    centroid: 0.0
+    unified: 0.0
+  schedule:
+    strategy: "two_stage"
+    phase_a_epochs: 30
+    ramp: "cosine"
+    target_weights:
+      metric: 1.0
+      anchor: 0.01
+      classification: 0.1
+    classification_cutoff:
+      epoch: 20
+      value: 0.0
+    keep_anchor_constant: true
+    unified:
+      num_neighbors: 4
+      epsilon: 0.01
+
+dynamic_sampling:
+  enabled: false
+  virtual_epoch_size: 300000
+  sigma_ratio: 0.01
+
+rendering:
+  target_faces: 500
+  mode: "cpu"
+  resolution: 512
+
+system:
+  device: "cuda"
+  quick_test: false
+  seed: 42

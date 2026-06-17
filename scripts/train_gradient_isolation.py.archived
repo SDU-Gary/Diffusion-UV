@@ -1,0 +1,185 @@
+"""
+实验三：梯度隔离消融实验
+
+目的：验证是否是UV头的切空间梯度污染了分类头
+方法：在compute_tangent_space_metric_loss之前detach哈希特征
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from pathlib import Path
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+
+import sys
+sys.path.append('/home/kyrie/Diffusion-UV')
+
+from src.models.metric_aligned_iuv_field import MetricAlignedIUVField
+from src.data.gpu_dataset import GPUDynamicSampleGenerator
+from src.training.metric_aligned_iuv_losses import compute_metric_aligned_iuv_loss
+
+def run_gradient_isolation_experiment(
+    mesh_constants_path: str,
+    output_dir: str,
+    epochs: int = 5,
+    batch_size: int = 16384,
+):
+    """
+    训练模型，但在tangent space模式下detach UV头的哈希特征
+    """
+
+    logger.info("=" * 80)
+    logger.info("实验三：梯度隔离消融实验")
+    logger.info("=" * 80)
+    logger.info(f"训练配置: {epochs} epochs, batch_size={batch_size}")
+    logger.info(f"关键修改: UV头使用detached哈希特征（梯度隔离）")
+
+    device = torch.device('cuda')
+
+    # 创建模型
+    model = MetricAlignedIUVField(
+        num_charts=8,
+        hidden_dim=64,
+        num_layers=2,
+        encoder_type="bspline_hash",
+        hash_num_levels=16,
+        hash_features_per_level=2,
+        hash_log2_size=19,
+    ).to(device)
+
+    # 创建数据生成器
+    generator = GPUDynamicSampleGenerator(
+        mesh_constants_path=mesh_constants_path,
+        batch_size=batch_size,
+        sigma_ratio=0.01,
+        device=device,
+    )
+
+    # 根据编码器类型设置优化器参数
+    if model.encoder_type == "bspline_hash":
+        encoder_params = model.grid_encoder.parameters()
+    else:
+        encoder_params = model.pos_enc.parameters()
+
+    optimizer = optim.Adam([
+        {'params': encoder_params, 'lr': 1e-3},
+        {'params': model.encoder.parameters(), 'lr': 1e-3},
+        {'params': model.chart_head.parameters(), 'lr': 1e-3},
+        {'params': model.uv_head.parameters(), 'lr': 1e-3},
+    ])
+
+    cls_weight = 1.0
+    metric_weight = 0.01
+    anchor_weight = 1.0
+
+    best_cls_acc = 0.0
+
+    logger.info("\n开始训练...")
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+
+        total_loss = 0.0
+        total_cls_correct = 0
+        total_cls_samples = 0
+        num_batches = 0
+
+        steps_per_epoch = 19
+
+        for step in range(steps_per_epoch):
+            # 采样batch
+            batch = generator.next_batch()
+
+            pos = batch['pos'].to(device)
+            j_3d_gt = batch['j_3d_gt'].to(device)
+            uv_anchor = batch['uv_anchor'].to(device)
+            chart_id = batch['chart_id'].to(device)
+            normals = batch['normals'].to(device)
+
+            # 关键修改：detach位置信息，防止UV梯度回传到编码器
+            pos_detached = pos.clone().detach().requires_grad_(True)
+
+            # 前向传播（使用detached位置）
+            model_output = model(pos_detached)
+
+            # 计算loss（带tangent space）
+            loss_dict = compute_metric_aligned_iuv_loss(
+                model_output=model_output,
+                pos=pos_detached,  # 使用detached位置
+                j_3d_gt=j_3d_gt,
+                uv_anchor=uv_anchor,
+                chart_id=chart_id,
+                normals=normals,
+                use_tangent_space=True,  # 启用tangent space
+                metric_weight=metric_weight,
+                anchor_weight=anchor_weight,
+                cls_weight=cls_weight,
+            )
+
+            loss = loss_dict['total']
+
+            # 反向传播和优化
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # 统计
+            pred_chart_id = model_output.logits.argmax(-1)
+            cls_correct = (pred_chart_id == chart_id).sum().item()
+            cls_acc = cls_correct / pos.shape[0]
+
+            total_loss += loss.item()
+            total_cls_correct += cls_correct
+            total_cls_samples += pos.shape[0]
+            num_batches += 1
+
+        avg_loss = total_loss / num_batches
+        avg_cls_acc = total_cls_correct / total_cls_samples
+
+        logger.info(f"Epoch {epoch}/{epochs}: Loss={avg_loss:.4f}, ClsAcc={avg_cls_acc:.4f}")
+
+        if avg_cls_acc > best_cls_acc:
+            best_cls_acc = avg_cls_acc
+            logger.info(f"  🎯 新的最佳分类准确率: {best_cls_acc:.4f}")
+
+            # 保存checkpoint
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_cls_acc': best_cls_acc,
+            }, Path(output_dir) / 'best.pt')
+
+    logger.info("\n" + "=" * 80)
+    logger.info("实验三结果总结:")
+    logger.info(f"  最佳分类准确率: {best_cls_acc:.4f}")
+    logger.info(f"  对比:")
+    logger.info(f"    - Baseline (无tangent): 97.52%")
+    logger.info(f"    - Tangent Space (未隔离): 15.09%")
+    logger.info(f"    - Tangent Space (梯度隔离): {best_cls_acc*100:.2f}%")
+
+    if best_cls_acc > 0.90:
+        logger.info("\n  ✅ 结论: 分类准确率恢复！证明是UV头的梯度污染了分类头。")
+        logger.info("       这说明tangent space projection的梯度确实有毒，需要SDF连续法线。")
+    else:
+        logger.info("\n  ❌ 结论: 分类准确率未恢复。问题可能不仅是梯度污染。")
+
+    logger.info("=" * 80)
+
+    return best_cls_acc
+
+if __name__ == "__main__":
+    result = run_gradient_isolation_experiment(
+        mesh_constants_path="data/models/bunny_mesh_constants.pt",
+        output_dir="outputs/gradient_isolation_experiment",
+        epochs=5,
+        batch_size=16384,
+    )
+
+    print(f"\n最终分类准确率: {result:.4f}")

@@ -1,0 +1,112 @@
+# =============================================================================
+# Production Training Configuration - CPU Version
+# =============================================================================
+
+# Data Configuration
+data:
+  high_mesh_path: "data/models/stanford-bunny.obj"
+  low_mesh_path: ""
+  texture_path: ""
+  cache_dir: "./cache/bunny_production_cpu"
+  num_samples_per_epoch: 200000  # Smaller for CPU
+  sampling_ratios:
+    surface: 0.4
+    near_surface: 0.4
+    exterior: 0.1
+    interior: 0.1
+  near_surface_epsilon: 0.01
+  lowpass_sigma: 5.0
+
+# Network G: Geometry Network (SDF + Low-freq Color)
+network_g:
+  hidden_dim: 256
+  num_layers: 8
+  positional_encoding_freqs: 6
+  skip_connection_layer: 4
+  include_raw_input: true
+  sdf_output_range: 1.0
+
+# Network D: Diffusion Model
+network_d:
+  condition_dim: 42
+  num_diffusion_steps: 1000
+  inference_steps: 10
+  scheduler_type: "linear"
+  hidden_channels: 128
+  num_down_layers: 2
+  num_res_blocks: 4
+  use_film: true
+  film_hidden_dim: 256
+  use_ema: false        # Disable EMA for CPU
+  ema_decay: 0.9999
+
+# Network R: Reverse Mapping Network
+network_r:
+  hidden_dim: 128
+  num_layers: 3
+  num_classes: 32
+  positional_encoding_freqs: 4
+
+# Training Configuration
+training:
+  # Production training epochs
+  phase1_epochs: 500
+  phase2_epochs: 200
+  phase3_epochs: 100
+
+  # Smaller batch sizes for CPU
+  batch_size_phase1: 16384   # 16K samples
+  batch_size_phase2: 8192    # 8K samples
+  batch_size_phase3: 4096    # 4K samples
+
+  # Learning rates
+  learning_rate_g: 1.0e-3
+  learning_rate_d: 1.0e-4
+  learning_rate_r: 1.0e-4
+
+  optimizer: "adam"
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+  mixed_precision: false  # Disable FP16 for CPU
+
+  # Loss weights
+  lambda_sdf: 1.0
+  lambda_eikonal: 0.1
+  lambda_color_base: 1.0
+  lambda_diffusion: 1.0
+  lambda_reverse_start: 0.1
+  lambda_reverse_end: 0.5
+  lambda_entropy_start: 0.0
+  lambda_entropy_end: 0.05
+
+# Loss Configuration
+loss:
+  lambda_sdf: 1.0
+  lambda_eikonal: 0.1
+  lambda_color_base: 1.0
+  lambda_diffusion: 1.0
+  lambda_reverse: 0.1
+  lambda_entropy: 0.0
+
+# Logging Configuration
+logging:
+  log_dir: "./logs"
+  experiment_name: "bunny_production_cpu"
+  use_wandb: true
+  use_tensorboard: false
+  wandb_project: "diffusion-uv"
+  wandb_mode: "online"
+  log_interval: 100
+  render_interval: 50
+  save_interval: 50
+
+# Evaluation Configuration
+evaluation:
+  eval_interval: 50
+  num_render_views: 12
+  render_resolution: 512
+  output_dir: "./outputs"
+
+# Experiment Settings
+seed: 42
+device: "cpu"
